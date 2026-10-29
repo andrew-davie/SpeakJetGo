@@ -289,6 +289,53 @@ func (sj *SpeakJet) bendHz() float64 {
 }
 
 // the master volume: measured on AW, 16 to 127 is only 6 dB
+// the library's own sin, exp and log for everything done per sample: a
+// platform's last bits differ, and the output quantiser turns a last bit on
+// the wrong side of a step into a whole step. plain series in float64, the
+// same as the C library's. sin2pi takes cycles
+func sin2pi(x float64) float64 {
+	x -= math.Floor(x + 0.5) // [-0.5, 0.5)
+	if x > 0.25 {
+		x = 0.5 - x
+	} else if x < -0.25 {
+		x = -0.5 - x // [-0.25, 0.25]
+	}
+	y := 2.0 * math.Pi * x
+	y2 := y * y
+	term, sum := y, y
+	for n := 1; n <= 9; n++ { // to y^19: under 1e-15 at pi/2
+		term *= -y2 / ((2.0 * float64(n)) * (2.0*float64(n) + 1.0))
+		sum += term
+	}
+	return sum
+}
+
+func exp(x float64) float64 {
+	if x < -700.0 {
+		return 0.0
+	}
+	k := math.Floor(x/math.Ln2 + 0.5)
+	r := x - k*math.Ln2 // |r| <= ln2 / 2
+	term, sum := 1.0, 1.0
+	for n := 1; n <= 15; n++ {
+		term *= r / float64(n)
+		sum += term
+	}
+	return math.Ldexp(sum, int(k))
+}
+
+func log(x float64) float64 {
+	m, e := math.Frexp(x) // m in [0.5, 1)
+	s := (m - 1.0) / (m + 1.0)
+	s2 := s * s // |s| <= 1/3
+	term, sum := s, s
+	for n := 1; n <= 15; n++ {
+		term *= s2
+		sum += term / (2.0*float64(n) + 1.0)
+	}
+	return 2.0*sum + float64(e)*math.Ln2
+}
+
 func (sj *SpeakJet) volumeGain() float64 {
 	db := [5]float64{-3.3, -1.3, -0.6, 0.0, 2.5}
 	at := [5]float64{16, 32, 64, 96, 127}
@@ -306,7 +353,7 @@ func (sj *SpeakJet) volumeGain() float64 {
 		}
 		d = db[i] + (db[i+1]-db[i])*(v-at[i])/(at[i+1]-at[i])
 	}
-	return math.Pow(10.0, d/20.0)
+	return exp(d / 20.0 * math.Ln10)
 }
 
 func bent(hz float64, bend float64) float32 {
@@ -646,9 +693,9 @@ func (sj *SpeakJet) chipSample() float64 {
 		fa, fb := float64(s.from.f[k]), float64(s.to.f[k])
 		switch {
 		case s.flags&fxExp != 0 && fa > 0 && fb > 0:
-			f.f[k] = float32(fa * math.Pow(fb/fa, t))
+			f.f[k] = float32(fa * exp(t*log(fb/fa)))
 		case s.flags&fxExpDecay != 0:
-			f.f[k] = float32(fb + (fa-fb)*math.Exp(-4.0*t))
+			f.f[k] = float32(fb + (fa-fb)*exp(-4.0*t))
 		default:
 			f.f[k] = float32(lerp(fa, fb, t))
 		}
@@ -688,7 +735,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		// envelope-shaped term beside the sines, against their starting direction
 		sum := -float64(f.dc)
 		for k := 0; k < nf; k++ {
-			sum += float64(f.a[k]) * math.Sin(2.0*math.Pi*sj.phase[k])
+			sum += float64(f.a[k]) * sin2pi(sj.phase[k])
 			sj.phase[k] += float64(f.f[k]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
 		if s.flags&fxPulsed != 0 {
@@ -696,7 +743,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		}
 		v += env * sum / 128.0
 		if nf == 2 {
-			v += float64(f.a[2]) / 128.0 * 0.6 * math.Sin(2.0*math.Pi*sj.phase[2])
+			v += float64(f.a[2]) / 128.0 * 0.6 * sin2pi(sj.phase[2])
 			sj.phase[2] += float64(f.f[2]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
 		sj.ptick--
@@ -705,7 +752,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		// plain tones (the effects)
 		for k := 0; k < 3; k++ {
 			if f.f[k] > 0 && f.a[k] > 0 {
-				v += float64(f.a[k]) / 128.0 * 0.6 * math.Sin(2.0*math.Pi*sj.phase[k])
+				v += float64(f.a[k]) / 128.0 * 0.6 * sin2pi(sj.phase[k])
 			}
 			sj.phase[k] += float64(f.f[k]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
@@ -722,7 +769,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		// its centre and back, quieter at the top (measured on C8 and C9: 650
 		// Hz to 3 kHz and back every 20 ms with a 13 dB dip, both units)
 		if s.flags&fxNSweep != 0 && s.gate > 0 {
-			sw := math.Sin(math.Pi * float64(sj.tick%s.gate) / float64(s.gate))
+			sw := sin2pi(0.5 * float64(sj.tick%s.gate) / float64(s.gate))
 			nf *= 0.4 + 1.6*sw
 			lvl = 1.0 - 0.75*sw
 		}
@@ -730,7 +777,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		if nw < 10 {
 			nw = 10
 		}
-		r, c := math.Exp(-math.Pi*nw/rate), math.Cos(2.0*math.Pi*nf/rate)
+		r, c := exp(-math.Pi*nw/rate), sin2pi(nf/rate+0.25)
 		r2 := r * r
 		g := math.Sqrt((1.0 - r2) * ((1.0+r2)*(1.0+r2) - 4.0*r2*c*c) / (1.0 + r2))
 		y := g*sj.random() + 2.0*r*c*sj.nz[0] - r2*sj.nz[1]
@@ -743,10 +790,10 @@ func (sj *SpeakJet) chipSample() float64 {
 		v = 0.0
 	}
 	if s.flags&fxDecay != 0 {
-		v *= math.Pow(10.0, -decayDB*t/20.0)
+		v *= exp(-decayDB * t / 20.0 * math.Ln10)
 	}
 	if s.flags&fxBump != 0 {
-		v *= math.Sin(math.Pi * t)
+		v *= sin2pi(0.5 * t)
 	}
 
 	// the sound's attack and release
