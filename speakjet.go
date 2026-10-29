@@ -45,8 +45,8 @@ const (
 	speedB       = 48.0
 	fxSpeedA     = 149.0 // the effects' (they shorten faster)
 	fxSpeedB     = 35.0
-	fastShare    = -0.3 // Fast and Slow add this times the manual's length
-	slowShare    = 0.35
+	fastFactor   = 0.77 // Fast and Slow: factors on the played length
+	slowFactor   = 1.22
 	copyExtraMs  = 0.0  // a Repeat copy adds this to the manual's length
 	bendHz       = 44.0 // Bend step
 )
@@ -148,6 +148,7 @@ type SpeakJet struct {
 	// the controls
 	volume, speed, pitch, bend, repeat uint8
 	fast, slow, stress, relax          bool
+	joined                             bool // the last sound ran straight into the next: no ramps at that join
 
 	// what is playing
 	seg             [maxSegments]segment
@@ -257,15 +258,19 @@ func (sj *SpeakJet) speedFactor(effect bool) float64 {
 	return (speedA - float64(sj.speed)) / speedB
 }
 
-// Fast and Slow take away or add a share of the manual's length (measured
-// half: AW +35, IH +40, SE +20, EYIY +75 ms under Slow): the manual's "1/2"
-// and "1 1/2 times" are of its own length column
+// Fast and Slow: measured (VoxRecord section 7, both units) as x0.77 and
+// x1.22 of the played length on vowels, nasals and fricatives; the stops
+// don't change (TT is 45-50 ms plain, fast or slow)
 func (sj *SpeakJet) modifiedMs(idx int, ms float64) float64 {
+	k := allophones[idx].kind
+	if k == kStop || k == kVStop || k == kAffr {
+		return ms
+	}
 	if sj.fast {
-		ms += fastShare * float64(manualMs[idx])
+		ms *= fastFactor
 	}
 	if sj.slow {
-		ms += slowShare * float64(manualMs[idx])
+		ms *= slowFactor
 	}
 	if ms < 10 {
 		return 10
@@ -395,11 +400,25 @@ func (sj *SpeakJet) copySegments(idx int) int {
 }
 
 // expand an allophone into segments: its first play
+// the frame a sound's transition starts from: the last frame, or, after
+// silence, the sound's own frame at no level (the formants don't sweep up
+// from 0 Hz at the start of a phrase or after a pause)
+func (sj *SpeakJet) fromFrame(tgt frame) frame {
+	if sj.last.a[0] > 0 || sj.last.a[1] > 0 || sj.last.a[2] > 0 || sj.last.na > 0 {
+		return sj.last
+	}
+	tgt.a = [3]float32{}
+	tgt.dc = 0
+	tgt.na = 0
+	return tgt
+}
+
 func (sj *SpeakJet) playAllophone(idx int) {
 	a := &allophones[idx]
 	bend := sj.bendHz()
 	tk := ticks(sj.modifiedMs(idx, float64(a.ms)*msStep) * sj.speedFactor(false))
 	tgt := alloFrame(a, false, bend)
+	from := sj.fromFrame(tgt)
 	sj.nseg = 0
 	var silent frame
 	switch a.kind {
@@ -408,7 +427,7 @@ func (sj *SpeakJet) playAllophone(idx int) {
 		if tr > tk {
 			tr = tk
 		}
-		sj.addSegment(tr, sj.last, tgt, true)
+		sj.addSegment(tr, from, tgt, true)
 		sj.addSegment(tk-tr, tgt, tgt, true)
 	case kGlide:
 		tgt2 := alloFrame(a, true, bend)
@@ -416,7 +435,7 @@ func (sj *SpeakJet) playAllophone(idx int) {
 		if tr > tk/2 {
 			tr = tk / 2
 		}
-		sj.addSegment(tr, sj.last, tgt, true)
+		sj.addSegment(tr, from, tgt, true)
 		sj.addSegment(tk-tr, tgt, tgt2, true)
 	case kFric:
 		sj.addSegment(tk, tgt, tgt, false)
@@ -475,14 +494,25 @@ func (sj *SpeakJet) nextCommand() {
 		switch {
 		case code <= 6:
 			sj.playPause(pauseMs[code])
+			sj.joined = false
 		case code >= 128 && code <= 199:
 			sj.playAllophone(int(code) - 128)
 			sj.repeat = 0
+			// the level ramps were measured on sounds played alone. inside a
+			// phrase the chip's level never drops more than 14-30 dB between
+			// sounds (Man Goes Down, both units) where ramping every sound out
+			// and in drops it 40-65 dB: a sound that follows straight on starts
+			// without its attack, and one followed straight on ends without its
+			// release
+			if sj.joined {
+				sj.attack = 0
+			}
+			sj.joined = false
 			// followed at once by another sound: the next one's start covers
 			// this one's end
-			if sj.count > n && sj.peek(n) >= 128 && sj.peek(n) <= 254 && sj.nseg > 0 {
+			next := sj.nextSound(n)
+			if next >= 0 && sj.nseg > 0 {
 				l := &sj.seg[sj.nseg-1]
-				next := int(sj.peek(n))
 				both := l.voiced && next <= 199 && allophones[next-128].kind != kFric && allophones[next-128].kind != kStop
 				cut := ticks(overlapMs)
 				if both {
@@ -492,10 +522,13 @@ func (sj *SpeakJet) nextCommand() {
 					l.ticks -= cut
 					sj.stotal -= cut
 				}
+				sj.release = 0
+				sj.joined = true
 			}
 		case code >= 200 && code <= 254:
 			sj.playEffect(int(code))
 			sj.repeat = 0
+			sj.joined = false
 		default:
 			switch code {
 			case 7:
@@ -530,6 +563,29 @@ func (sj *SpeakJet) nextCommand() {
 			sj.executing = 0
 		}
 	}
+}
+
+// the next sound in the buffer after offset i, looking past the modifiers and
+// settings that sit between sounds (Fast, Slow, Stress, Relax, Pitch, Speed,
+// Volume, Bend, Repeat): a phrase from text puts a pitch or a stress before
+// most sounds. a pause, a delay, a reset or the end of the buffer means the
+// sound is not followed at once: -1
+func (sj *SpeakJet) nextSound(i int) int {
+	for i < sj.count {
+		c := int(sj.peek(i))
+		if c >= 128 && c <= 254 {
+			return c
+		}
+		switch c {
+		case 7, 8, 14, 15, 16:
+			i++
+		case 20, 21, 22, 23, 26:
+			i += 2
+		default:
+			return -1
+		}
+	}
+	return -1
 }
 
 // the sound has ended: retire its command, clear the one-shot modifiers
