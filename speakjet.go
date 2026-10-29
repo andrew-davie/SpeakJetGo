@@ -163,7 +163,7 @@ type SpeakJet struct {
 	// synthesizer state
 	period, ptick int
 	phase         [3]float64
-	nz            float64 // the noise oscillator's phase
+	nz            [2]float64 // the noise resonator's two delays
 	rnd           uint32
 	lastr         float64 // the previous noise sample, for the floor's high pass
 
@@ -367,6 +367,15 @@ func (sj *SpeakJet) playEffect(code int) {
 }
 
 func alloFrame(a *allophone, second bool, bend float64) frame {
+	// a glide runs from one allophone's frame to another's, levels included
+	// (measured on all 16: IYRR starts on IY and ends on RR); a glide's f[0] and
+	// f[1] hold the two allophones' indices and it has no formants of its own
+	if a.kind == kGlide {
+		if second {
+			return alloFrame(&allophones[a.f[1]], false, bend)
+		}
+		return alloFrame(&allophones[a.f[0]], false, bend)
+	}
 	var f frame
 	for k := 0; k < 3; k++ {
 		if second {
@@ -392,7 +401,11 @@ func (sj *SpeakJet) copySegments(idx int) int {
 	tgt := alloFrame(a, false, bend)
 	sj.nseg = 0
 	if a.kind == kGlide {
-		sj.addSegment(tk, tgt, alloFrame(a, true, bend), true)
+		tgt2 := alloFrame(a, true, bend)
+		hold, move := tk/5, tk*7/10
+		sj.addSegment(hold, tgt, tgt, true)
+		sj.addSegment(move, tgt, tgt2, true)
+		sj.addSegment(tk-hold-move, tgt2, tgt2, true)
 	} else {
 		sj.addSegment(tk, tgt, tgt, int(a.a[0])+int(a.a[1])+int(a.a[2]) > 0)
 	}
@@ -430,13 +443,19 @@ func (sj *SpeakJet) playAllophone(idx int) {
 		sj.addSegment(tr, from, tgt, true)
 		sj.addSegment(tk-tr, tgt, tgt, true)
 	case kGlide:
+		// measured on the chip's glides: the first frame holds for a fifth of
+		// the sound, the move takes the next seven tenths, the second frame
+		// holds the last tenth
 		tgt2 := alloFrame(a, true, bend)
+		hold, move := tk/5, tk*7/10
 		tr := ticks(transitionMs)
-		if tr > tk/2 {
-			tr = tk / 2
+		if tr > hold {
+			tr = hold
 		}
 		sj.addSegment(tr, from, tgt, true)
-		sj.addSegment(tk-tr, tgt, tgt2, true)
+		sj.addSegment(hold-tr, tgt, tgt, true)
+		sj.addSegment(move, tgt, tgt2, true)
+		sj.addSegment(tk-hold-move, tgt2, tgt2, true)
 	case kFric:
 		sj.addSegment(tk, tgt, tgt, false)
 	case kStop, kVStop:
@@ -692,11 +711,11 @@ func (sj *SpeakJet) chipSample() float64 {
 		}
 	}
 
-	// noise: an oscillator whose frequency is thrown about by white noise every
-	// sample, within +-nw of nf (the manual's register 6, "disordered with
-	// white noise"). with a wide throw the band is flat with sharp edges;
-	// thrown past the chip's Nyquist it folds back, which is the hiss sounds'
-	// peak at 4 kHz
+	// noise: white noise through a two-pole resonance at nf with bandwidth nw
+	// (the chip's hiss is random noise - Gaussian to the sample, both units -
+	// not a tone; FF, TH and HE are flat to 4 kHz, SH and CH peak near 2.3
+	// kHz, WH at 800 Hz, SE and SO at the top of the band). the gain holds
+	// the output power at the input's whatever the band (the AR(2) variance)
 	if f.na > 0 {
 		nf, lvl := float64(f.nf), 1.0
 		// fxNSweep: over each gate period the band climbs from 0.4 to 2 times
@@ -707,8 +726,17 @@ func (sj *SpeakJet) chipSample() float64 {
 			nf *= 0.4 + 1.6*sw
 			lvl = 1.0 - 0.75*sw
 		}
-		sj.nz += (nf + float64(f.nw)*2.0*sj.random()) / nominal
-		v += lvl * float64(f.na) / 128.0 * 0.7 * math.Sin(2.0*math.Pi*sj.nz)
+		nw := float64(f.nw)
+		if nw < 10 {
+			nw = 10
+		}
+		r, c := math.Exp(-math.Pi*nw/rate), math.Cos(2.0*math.Pi*nf/rate)
+		r2 := r * r
+		g := math.Sqrt((1.0 - r2) * ((1.0+r2)*(1.0+r2) - 4.0*r2*c*c) / (1.0 + r2))
+		y := g*sj.random() + 2.0*r*c*sj.nz[0] - r2*sj.nz[1]
+		sj.nz[1] = sj.nz[0]
+		sj.nz[0] = y
+		v += lvl * float64(f.na) / 128.0 * 0.86 * y
 	}
 
 	if s.gate > 0 && sj.tick%s.gate >= s.gate/2 {
