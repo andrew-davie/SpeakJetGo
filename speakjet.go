@@ -124,7 +124,7 @@ type allophone struct {
 	f      [3]uint8 // formants, hzStep
 	a      [3]uint8 // their levels, 0 to 31
 	g      [3]uint8 // kGlide: the second target
-	nf, nw uint8    // the noise band's centre and throw, hzStep
+	nf, nw uint8    // the noise band's centre and bandwidth, hzStep
 	na     uint8
 	cp     uint8 // the length of each further copy of a Repeat, msStep
 	dc     int8  // the voice's offset under the envelope, formant level units
