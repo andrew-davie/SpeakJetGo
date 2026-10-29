@@ -25,15 +25,17 @@ const (
 // the constants of the model, as the recordings gave them. the same values as
 // the C library's struct tune
 const (
-	envRise      = 8.0    // voicing envelope: linear rise, ticks
-	envFall      = 50.0   // and fall
-	lpfFc        = 2700.0 // the output stage's two poles
-	lpfQ         = 0.25
+	envRise      = 0.5    // voicing envelope: rise (under one tick: a step), ticks
+	envFall      = 58.0   // and linear fall
+	lpfFc        = 2396.0 // the output stage's two poles: real, near 2 kHz and 2.9 kHz
+	lpfQ         = 0.491
 	attackMs     = 35.0 // every sound's level ramp
 	releaseMs    = 30.0
 	fxAttackMs   = 10.0 // the effects'
 	fxReleaseMs  = 15.0
-	floor        = 0.10  // the output noise floor, relative
+	floor        = 0.018 // the output noise floor, relative (measured, 35 dB under a tone)
+	jitter       = 0.03  // every oscillator\'s frequency wanders by this fraction each sample (the skirts around the chip\'s tones)
+	quant        = 48.0  // the output\'s steps per full scale: the chip\'s output is coarse, about 5 bits across a vowel
 	decayDB      = 35.0  // an fxDecay part falls this many dB
 	transitionMs = 25.0  // the voice moves to a new sound's target over this
 	closureMs    = 30.0  // silence before a stop's burst
@@ -57,6 +59,7 @@ func ticks(ms float64) int { return int(ms*rate/1000.0 + 0.5) }
 // to 31) and one noise band (centre Hz, throw Hz, level 0 to 31)
 type frame struct {
 	f, a       [3]float32
+	dc         float32 // the voice's offset: a fourth oscillator at 0 Hz under the same envelope
 	nf, nw, na float32
 }
 
@@ -124,6 +127,7 @@ type allophone struct {
 	nf, nw uint8    // the noise band's centre and throw, hzStep
 	na     uint8
 	cp     uint8 // the length of each further copy of a Repeat, msStep
+	dc     int8  // the voice's offset under the envelope, formant level units
 }
 
 // the manual's lengths, for the copies of a Repeat
@@ -367,6 +371,7 @@ func alloFrame(a *allophone, second bool, bend float64) frame {
 		}
 		f.a[k] = float32(a.a[k])
 	}
+	f.dc = float32(a.dc)
 	f.nf, f.nw, f.na = float32(a.nf)*hzStep, float32(a.nw)*hzStep, float32(a.na)
 	return f
 }
@@ -574,6 +579,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		}
 		f.a[k] = float32(lerp(float64(s.from.a[k]), float64(s.to.a[k]), t))
 	}
+	f.dc = float32(lerp(float64(s.from.dc), float64(s.to.dc), t))
 	f.nf = float32(lerp(float64(s.from.nf), float64(s.to.nf), t))
 	f.nw = float32(lerp(float64(s.from.nw), float64(s.to.nw), t))
 	f.na = float32(lerp(float64(s.from.na), float64(s.to.na), t))
@@ -603,10 +609,12 @@ func (sj *SpeakJet) chipSample() float64 {
 		if s.flags&fxVoiced != 0 {
 			nf = 2
 		}
-		sum := 0.0
+		// the offset: measured on every voiced sound's pulse (both units), an
+		// envelope-shaped term beside the sines, against their starting direction
+		sum := -float64(f.dc)
 		for k := 0; k < nf; k++ {
 			sum += float64(f.a[k]) * math.Sin(2.0*math.Pi*sj.phase[k])
-			sj.phase[k] += float64(f.f[k]) / nominal
+			sj.phase[k] += float64(f.f[k]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
 		if s.flags&fxPulsed != 0 {
 			env *= 0.6
@@ -614,7 +622,7 @@ func (sj *SpeakJet) chipSample() float64 {
 		v += env * sum / 128.0
 		if nf == 2 {
 			v += float64(f.a[2]) / 128.0 * 0.6 * math.Sin(2.0*math.Pi*sj.phase[2])
-			sj.phase[2] += float64(f.f[2]) / nominal
+			sj.phase[2] += float64(f.f[2]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
 		sj.ptick--
 	} else {
@@ -624,7 +632,7 @@ func (sj *SpeakJet) chipSample() float64 {
 			if f.f[k] > 0 && f.a[k] > 0 {
 				v += float64(f.a[k]) / 128.0 * 0.6 * math.Sin(2.0*math.Pi*sj.phase[k])
 			}
-			sj.phase[k] += float64(f.f[k]) / nominal
+			sj.phase[k] += float64(f.f[k]) * (1.0 + jitter*2.0*sj.random()) / nominal
 		}
 	}
 
@@ -667,6 +675,8 @@ func (sj *SpeakJet) chipSample() float64 {
 	sj.stick++
 
 	v *= sj.volumeGain()
+	// the output stage's step size
+	v = math.Floor(v*quant+0.5) / quant
 	// the output noise floor: white under the effects' tones, rising with
 	// frequency under the voice (the valley between the first two formants is
 	// deeper on the chip than a white floor leaves it)
