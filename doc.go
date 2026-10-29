@@ -1,40 +1,40 @@
 // Package speakjet is an emulation of the SpeakJet speech and sound
 // synthesizer used in the AtariVox.
 //
-// It is written from the SpeakJet User's Manual (Magnevation, revision 1.1,
-// 2004) and from general phonetics. Where two independent sets of
-// measurements of the real chip agree, those replace guesses: the
-// openFPGA-7800 AtariVox engine's, and those behind Stella's SpeakJet engine.
-// They set some formants of nine allophones (see tables.go). No code or tables
-// were taken from either.
+// This is the second, from-scratch implementation. It was written from the
+// SpeakJet User's Manual (Magnevation, revision 1.1, 2004) and from
+// recordings of two AtariVoxes playing every sound and control, and from
+// nothing else; the aim was the smallest model that matches those recordings.
+// It is a line-for-line port of the C library (speakjet.c in
+// github.com/andrew-davie/SpeakJet), and renders the same samples.
 //
-// The manual documents the chip's synthesizer but not the MSA "sound
-// component database" that drives it, so the package is in two parts:
+// What the chip was found to do:
 //
-// Synthesizer (synth.go). Follows the manual's description of the 5-channel
-// synthesizer: oscillators 1 to 3 (0 to 3999Hz, volume 0 to 31) summed in a
-// mixer limited to 63; oscillators 4 and 5 with a shared distortion control
-// that spreads white noise around their frequency; a sixth oscillator that
-// envelopes the others (saw, sine, triangle or square); a master volume of 0
-// to 127; the chip's samples made at about 8kHz (measured, not the manual's
-// 8192) and held as the chip holds them, output at SampleRate (48kHz) through
-// the low pass after the chip, measured to 23kHz: see chipRate in synth.go.
-// Choices not in the manual: oscillators 1 to 3 are sines whose phase restarts
-// at each envelope period (so they ring like formants excited by a glottal
-// pulse), and distortion is applied as random frequency modulation.
+//   - It makes samples at about 8026 Hz (the two units: 8039 and 8013; the
+//     manual says 8192) and holds each until the next. Its own arithmetic
+//     assumes 8000: its tones come out rate/8000 sharp. The AtariVox then
+//     low-passes the held signal with about two real poles near 2.7 kHz. The
+//     output here is at 48 kHz so the images the hold puts up to 20 kHz are
+//     carried as the real thing's are.
+//   - Voicing: a period of floor(rate / Pitch) + 1 ticks. At the start of each
+//     period three formant sines restart and an envelope rises linearly for
+//     about 1 ms and falls linearly over about 6 ms; the sum of the sines
+//     times the envelope is the voice. The pulse is the same on both units.
+//   - Noise: an oscillator whose frequency is thrown about by white noise
+//     every sample (the manual's "distortion"); a wide throw makes a flat
+//     band, and thrown past the chip's Nyquist it folds back, which is the
+//     hiss sounds' peak at 4 kHz.
+//   - Bend moves every oscillator by 44 Hz a step; Volume 16 to 127 spans
+//     only 6 dB; Fast is x0.8 and Slow x1.25 on length; Speed is linear in
+//     length; Stress, Relax and code 18 do nothing measurable; a Repeat's
+//     copies each add about the manual's length; every sound ramps in over
+//     about 35 ms and out over 30; a sound followed at once by another is cut
+//     short.
 //
-// MSA (msa.go, tables.go). The allophone, control and sound effect behaviour.
-// Control ranges and defaults, pause behaviour, the 64 byte buffer and the
-// Buffer Half Full status are from the manual. The oscillator settings
-// for each allophone are derived from published formant measurements of
-// English speech, except for the formants that the two sets of measurements
-// of the chip agree on. Recordings of a real chip set how much longer than
-// the manual's lengths speech sounds play, Fast, the level of the noise sounds
-// and M1 (see steadyLength in tables.go); and the Speed curve, how pauses follow
-// Speed, three pause lengths, each allophone's length, the shape of the
-// fricatives' hiss and the other sound effects, which are traced from the
-// recording (see allophoneLength and fxPoints in tables.go, and speedFactor in
-// msa.go); and the output filter, five vowels' formants, each allophone's level,
-// Bend, Stress, Relax and the pitch (see chipRate in synth.go,
-// allophoneGainDB in tables.go, and bendHz, voiceHz and expand in msa.go).
+// Each allophone is 14 numbers (tables.go): its kind, measured length, three
+// formants with levels, a second target for the glides, and a noise band. Each
+// sound effect is one to six "parts" of up to three sweeping tones, a noise
+// band, a gate period and a few flags. Both tables were first read off the
+// recordings, then refined by fitting against them with a score that compares
+// the library to the chip the way two chips compare to each other.
 package speakjet
